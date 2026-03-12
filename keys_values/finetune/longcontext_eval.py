@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 from pprint import pprint
 from typing import Dict, Literal, Optional, Union, Any, List, Tuple, Set
+import torch.multiprocessing as mp
 
 try:
     import lightning as L
@@ -305,23 +306,52 @@ def setup(
             yarn_rope=yarn_rope,
         )
     else:
-        main(
-            fabric=None,
-            seed=seed,
-            data=data,
-            checkpoint_dir=checkpoint_dir,
-            out_dir=out_dir,
-            batch_size=batch_size,
-            kv_cache=kv_cache,
-            sdpa=sdpa,
-            model_type=model_type,
-            model_config=model_config,
-            eval_tasks=eval.tasks,
-            devices=devices,
-            verbose=verbose,
-            attention_forward_temp_size_gb=attention_forward_temp_size_gb,
-            yarn_rope=yarn_rope,
-        )
+        # Fallback without Lightning - multi-device support via PyTorch multiprocessing
+        if devices > 1:
+            print(f"Running with PyTorch multiprocessing on {devices} devices")
+
+            def _distributed_main(rank):
+                # Set CUDA device for this process
+                torch.cuda.set_device(rank)
+                main(
+                    fabric=None,
+                    seed=seed,
+                    data=data,
+                    checkpoint_dir=checkpoint_dir,
+                    out_dir=out_dir,
+                    batch_size=batch_size,
+                    kv_cache=kv_cache,
+                    sdpa=sdpa,
+                    model_type=model_type,
+                    model_config=model_config,
+                    eval_tasks=eval.tasks,
+                    devices=devices,
+                    verbose=verbose,
+                    attention_forward_temp_size_gb=attention_forward_temp_size_gb,
+                    yarn_rope=yarn_rope,
+                    rank=rank,
+                )
+
+            mp.spawn(_distributed_main, nprocs=devices)
+        else:
+            # Single device case
+            main(
+                fabric=None,
+                seed=seed,
+                data=data,
+                checkpoint_dir=checkpoint_dir,
+                out_dir=out_dir,
+                batch_size=batch_size,
+                kv_cache=kv_cache,
+                sdpa=sdpa,
+                model_type=model_type,
+                model_config=model_config,
+                eval_tasks=eval.tasks,
+                devices=devices,
+                verbose=verbose,
+                attention_forward_temp_size_gb=attention_forward_temp_size_gb,
+                yarn_rope=yarn_rope,
+            )
 
 
 def main(
@@ -340,6 +370,7 @@ def main(
     verbose: VerbosityLevels,
     attention_forward_temp_size_gb: float,
     yarn_rope: bool,
+    rank: int = 0,
 ) -> None:
     is_lora = model_type == "lora"
 
@@ -347,7 +378,7 @@ def main(
         if fabric is not None:
             device = torch.device("cuda", fabric.local_rank)
         else:
-            device = torch.device("cuda")
+            device = torch.device("cuda", rank)
     else:
         device = torch.device("cpu")
     tokenizer = Tokenizer(checkpoint_dir)
@@ -458,7 +489,7 @@ def main(
     if devices > 1:
         # Ensure that lock for first batch is not checked at exactly the same
         # time by all devices
-        time.sleep(0.05 * fabric.global_rank if fabric is not None else 0)
+        time.sleep(0.05 * rank)
     for batch in test_dataiter:
         if not batch:
             print("Empty batch: Continue")
@@ -473,7 +504,7 @@ def main(
         try:
             print_with_rank_and_timestamp(
                 f"Running inference for batch {task}, {orig_idxs}",
-                fabric.global_rank if fabric is not None else 0,
+                fabric.global_rank if fabric is not None else rank,
             )
             if test_dataloader.delay_tokenization:
                 # Tokenization only happens here
@@ -508,7 +539,7 @@ def main(
             print_with_rank_and_timestamp(
                 f"Batch {task}, {orig_idxs}: loss = {loss_value:.3f}, "
                 f"eval_time = {eval_time * 1000:.2f} ms",
-                fabric.global_rank if fabric is not None else 0
+                fabric.global_rank if fabric is not None else rank
             )
             flush_io_streams()
             print(f"Storing to {eval_metrics_path}")
